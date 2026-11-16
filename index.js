@@ -11,6 +11,15 @@ const pino = require("pino");
 const logger = pino({ level: "silent" });
 const ai = new GoogleGenAI({ apiKey: process.env.GEMINI_API_KEY });
 const MODELS = ["gemini-3.5-flash", "gemini-2.5-flash", "gemini-2.5-flash-lite"];
+const IMAGE_MODELS = ["gemini-2.5-flash-image", "gemini-3.1-flash-image"];
+const TOOLSETS = [
+  [{ googleSearch: {} }, { codeExecution: {} }],
+  [{ codeExecution: {} }],
+  [],
+];
+const MAX_FILE_BYTES = 15 * 1024 * 1024;
+const YT_REGEX =
+  /https?:\/\/(?:www\.|m\.)?(?:youtube\.com\/(?:watch\?v=|shorts\/)|youtu\.be\/)[\w-]+\S*/i;
 
 function systemPrompt() {
   const today = new Date().toISOString().slice(0, 10);
@@ -21,8 +30,9 @@ function systemPrompt() {
 - جاوب بدقة ومعلومات صحيحة. إلا ما كنتيش متأكد قول "ما متأكدش" وما تخترعش.
 - فـ الدردشة العادية: هضر بالدارجة المغربية بحال شاب، بجمل قصيرة وعفوية.
 - فـ النقاش: دافع على رأيك بحجج منطقية وأمثلة وأرقام، فكك حجج الطرف الآخر بهدوء ونقطة نقطة، وكون مقنع. بلا كذب وبلا تلاعب، وإلا كان الطرف الآخر عندو الحق، اعترف بهادشي.
+- فـ الرياضيات والحسابات والإحصاء والمنطق: استعمل تنفيذ الكود باش يكون الجواب دقيق، وشرح الخطوات.
 - فـ الأسئلة الصعيبة والتمارين: فكر مزيان، وحل خطوة خطوة، وشرح كل خطوة، وعطي الجواب النهائي بوضوح.
-- إلا جاتك صورة: قراها وحل ما فيها كامل. إلا جاك فويس: سمعو مزيان وجاوب على لي قال.
+- إلا جاتك صورة: قراها وحل ما فيها كامل. إلا جاك فويس: سمعو وجاوب على لي قال. إلا جاك فيديو ولا PDF ولا رابط يوتيوب: فهمو ولخصو وجاوب على لي طلب.
 - إلا طلب منك شي واحد أغنية: ما كتصيفطش الملف. عطيه سمية الأغنية والفنان، ورابط البحث فـ يوتيوب بهاد الشكل: https://www.youtube.com/results?search_query=سمية+الأغنية+الفنان
 - إلا سولك على شي حاجة جديدة ولا أخبار، استعمل البحث.
 - جاوب بنفس اللغة اللي كيهضر بها الشخص.
@@ -36,10 +46,10 @@ const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
 async function askGemini(contents) {
   for (const model of MODELS) {
-    for (const useSearch of [true, false]) {
+    for (let i = 0; i < TOOLSETS.length; i++) {
       try {
         const config = { systemInstruction: systemPrompt() };
-        if (useSearch) config.tools = [{ googleSearch: {} }];
+        if (TOOLSETS[i].length > 0) config.tools = TOOLSETS[i];
         const res = await ai.models.generateContent({
           model: model,
           contents: contents,
@@ -47,11 +57,27 @@ async function askGemini(contents) {
         });
         if (res.text) return res.text;
       } catch (e) {
-        console.error(
-          "ERROR with " + model + (useSearch ? " +search" : "") + ":",
-          e.message
-        );
+        console.error("ERROR with " + model + " tools#" + i + ":", e.message);
       }
+    }
+  }
+  return null;
+}
+
+async function generateImage(prompt) {
+  for (const model of IMAGE_MODELS) {
+    try {
+      const res = await ai.models.generateContent({
+        model: model,
+        contents: [{ parts: [{ text: prompt }] }],
+        config: { responseModalities: ["TEXT", "IMAGE"] },
+      });
+      const part = res.candidates?.[0]?.content?.parts?.find(
+        (p) => p.inlineData
+      );
+      if (part) return Buffer.from(part.inlineData.data, "base64");
+    } catch (e) {
+      console.error("IMAGE GEN ERROR with " + model + ":", e.message);
     }
   }
   return null;
@@ -93,9 +119,14 @@ async function start() {
     const msg = m.message;
     const img = msg.imageMessage;
     const audio = msg.audioMessage;
+    const video = msg.videoMessage;
+    const doc =
+      msg.documentMessage ||
+      msg.documentWithCaptionMessage?.message?.documentMessage;
+    const caption = img?.caption || video?.caption || doc?.caption || "";
     const text =
-      msg.conversation || msg.extendedTextMessage?.text || img?.caption || "";
-    if (!text && !img && !audio) return;
+      msg.conversation || msg.extendedTextMessage?.text || caption || "";
+    if (!text && !img && !audio && !video && !doc) return;
 
     if (m.key.fromMe) {
       if (text === ".stop") {
@@ -115,8 +146,31 @@ async function start() {
 
     if (!enabled) return;
 
+    // توليد صورة
+    const imgCmd = text.match(/^\.(?:img|صورة)\s+([\s\S]+)/);
+    if (imgCmd && !img && !video && !doc && !audio) {
+      await sock.sendPresenceUpdate("composing", jid);
+      const buf = await generateImage(imgCmd[1].trim());
+      if (buf) {
+        await sock.sendMessage(jid, { image: buf, caption: "🎨" });
+      } else {
+        await sock.sendMessage(jid, {
+          text: "ما قدرتش نصاوب الصورة دابا (غالبا هاد الميزة ماشي مجانية) 🙏",
+        });
+      }
+      return;
+    }
+
+    if (doc && !(doc.mimetype || "").includes("pdf")) {
+      await sock.sendMessage(jid, {
+        text: "حاليا كنقرا غير ملفات PDF 📄",
+      });
+      return;
+    }
+
     const parts = [];
-    const media = img || audio;
+    const media = img || audio || video || doc;
+    let label = "";
     if (media) {
       try {
         const buffer = await downloadMediaMessage(
@@ -125,13 +179,26 @@ async function start() {
           {},
           { logger: logger, reuploadRequest: sock.updateMediaMessage }
         );
-        const fallbackType = img ? "image/jpeg" : "audio/ogg";
+        if (buffer.length > MAX_FILE_BYTES) {
+          await sock.sendMessage(jid, {
+            text: "الملف كبير بزاف (أكثر من 15 MB)، صيفط شي حاجة أصغر 🙏",
+          });
+          return;
+        }
+        const fallbackType = img
+          ? "image/jpeg"
+          : audio
+          ? "audio/ogg"
+          : video
+          ? "video/mp4"
+          : "application/pdf";
         parts.push({
           inlineData: {
             mimeType: (media.mimetype || fallbackType).split(";")[0],
             data: buffer.toString("base64"),
           },
         });
+        label = img ? "[صورة] " : audio ? "[فويس] " : video ? "[فيديو] " : "[PDF] ";
       } catch (e) {
         console.error("MEDIA ERROR:", e.message);
         await sock.sendMessage(jid, {
@@ -141,23 +208,38 @@ async function start() {
       }
     }
 
+    const ytMatch = text.match(YT_REGEX);
+    if (ytMatch) {
+      parts.unshift({ fileData: { fileUri: ytMatch[0] } });
+      label = "[يوتيوب] ";
+    }
+
     let prompt = text;
     if (!prompt && img) prompt = "حل ليا هاد التمرين لي فـ الصورة.";
     if (!prompt && audio) prompt = "سمع هاد الفويس وجاوب على لي قال فيه.";
+    if (!prompt && video) prompt = "شوف هاد الفيديو ولخصو ليا.";
+    if (!prompt && doc) prompt = "لخص ليا هاد الملف وعطيني النقط المهمة فيه.";
     parts.push({ text: prompt });
 
     const history = (histories[jid] ||= []);
     await sock.sendPresenceUpdate("composing", jid);
-    const answer = await askGemini([...history, { role: "user", parts: parts }]);
+    let answer = await askGemini([...history, { role: "user", parts: parts }]);
+
+    if (!answer && ytMatch) {
+      const plain = parts.filter((p) => !p.fileData);
+      answer = await askGemini([...history, { role: "user", parts: plain }]);
+      if (answer) {
+        answer = "(ما قدرتش نحل الفيديو ديال يوتيوب)\n\n" + answer;
+      }
+    }
 
     if (!answer) return;
 
-    const label = img ? "[صورة] " : audio ? "[فويس] " : "";
     history.push({ role: "user", parts: [{ text: label + prompt }] });
     history.push({ role: "model", parts: [{ text: answer }] });
     history.splice(0, Math.max(0, history.length - 20));
 
-    await sleep(2000 + Math.random() * 3000);
+    await sleep(1500 + Math.random() * 2500);
     await sock.sendMessage(jid, { text: answer });
   });
 }
