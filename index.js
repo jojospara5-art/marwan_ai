@@ -236,6 +236,35 @@ async function askGroq(jid, history, userText) {
   return null;
 }
 
+// ---------- التصنيف: دردشة عادية ولا سؤال جدي ----------
+async function classify(text) {
+  if (!GROQ_KEY) return "knowledge";
+  if (NEEDS_GEMINI.test(text) || text.length > 200) return "knowledge";
+  const model = GROQ_MODELS[GROQ_MODELS.length - 1];
+  try {
+    const body = {
+      model: model,
+      messages: [
+        {
+          role: "system",
+          content:
+            "صنف رسالة المستخدم. جاوب بكلمة وحدة فقط: casual إلا كانت دردشة عادية (سلام، كيداير، نكت، رأي بسيط، شكرا، كلام يومي، حفظ ولا مسح ملاحظة ولا معلومة على المستخدم). وجاوب knowledge إلا كانت سؤال ثقافي ولا علمي ولا ديني ولا تاريخي ولا تعليمي ولا تمرين ولا نقاش ولا طلب شرح ولا نصيحة جدية.",
+        },
+        { role: "user", content: text },
+      ],
+      temperature: 0,
+      max_tokens: 500,
+    };
+    if (model.includes("gpt-oss")) body.reasoning_effort = "low";
+    const out = await groqChat(body);
+    const w = (out.choices[0].message.content || "").toLowerCase();
+    return w.includes("casual") ? "casual" : "knowledge";
+  } catch (e) {
+    console.error("CLASSIFY ERROR:", e.message);
+    return "knowledge";
+  }
+}
+
 async function transcribe(buffer, mime) {
   if (!GROQ_KEY) return null;
   try {
@@ -517,11 +546,12 @@ async function start() {
     const history = (histories[jid] ||= []);
     await sock.sendPresenceUpdate("composing", jid);
 
-    const needsGemini = (media && !transcribed) || NEEDS_GEMINI.test(prompt);
+    const hasBinary = media && !transcribed;
+    const route = hasBinary ? "knowledge" : await classify(prompt);
     let answer = null;
     let engine = "";
 
-    if (!needsGemini) {
+    if (route === "casual") {
       answer = await askGroq(jid, history, prompt);
       if (answer) engine = "groq";
     }
@@ -532,11 +562,11 @@ async function start() {
       ]);
       if (answer) engine = "gemini";
     }
-    if (!answer && needsGemini && !(media && !transcribed)) {
+    if (!answer && route !== "casual" && !hasBinary) {
       answer = await askGroq(jid, history, prompt);
       if (answer) engine = "groq-fallback";
     }
-    console.log("ANSWER via", engine || "none");
+    console.log("ROUTE:", route, "| ANSWER via", engine || "none");
 
     if (!answer) {
       await sock.sendMessage(jid, {
