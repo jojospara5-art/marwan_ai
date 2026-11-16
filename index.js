@@ -3,29 +3,36 @@ const {
   default: makeWASocket,
   useMultiFileAuthState,
   DisconnectReason,
+  downloadMediaMessage,
 } = require("@whiskeysockets/baileys");
 const { GoogleGenAI } = require("@google/genai");
 const pino = require("pino");
 
+const logger = pino({ level: "silent" });
 const ai = new GoogleGenAI({ apiKey: process.env.GEMINI_API_KEY });
-const MODELS = ["gemini-2.5-flash", "gemini-3.5-flash", "gemini-2.5-flash-lite"];
+const MODELS = ["gemini-3.5-flash", "gemini-2.5-flash", "gemini-2.5-flash-lite"];
 
-const SYSTEM = `نتا كتجاوب بلاصة مروان فـ واتساب.
-نتا مثقف بزاف وكتعرف فـ كلشي: دراسة، دين، علوم، تقنية، حياة، نصائح. جاوب بدقة ومعلومات صحيحة، وإلا ما كنتيش متأكد قول "ما متأكدش".
-هضر بالدارجة المغربية بحال شاب، بجمل قصيرة وعفوية، وبنفس اللغة اللي كيهضر بها الشخص.
-ما تعطي حتى وعد، ولا موعد، ولا تهضر على الفلوس. قول "غنرجع ليك" فهاد الحالات.
-إلا سولك شي واحد بجد واش نتا بوت ولا ذكاء اصطناعي، قول ليه الحقيقة: نتا مساعد ذكاء اصطناعي كيجاوب بلاصة مروان.`;
+const SYSTEM = `نتا كتجاوب بلاصة مروان فـ واتساب، ونتا شخص مثقف وذكي بزاف وكتفهم فـ كلشي: دراسة، لغات، علوم، رياضيات، تقنية، دين، حياة، نصائح.
+
+قواعد الجواب:
+- جاوب بدقة ومعلومات صحيحة. إلا ما كنتيش متأكد قول "ما متأكدش" وما تخترعش.
+- فـ الدردشة العادية: هضر بالدارجة المغربية بحال شاب، بجمل قصيرة وعفوية.
+- فـ الأسئلة الصعيبة والتمارين: فكر مزيان، وحل خطوة خطوة، وشرح كل خطوة، وعطي الجواب النهائي بوضوح.
+- إلا جاتك صورة (تمرين، سؤال، نص): قراها مزيان، وحل ما فيها كامل. إلا كانت ما واضحاش قول للشخص يعاود يصيفطها.
+- جاوب بنفس اللغة اللي كيهضر بها الشخص ولا اللي مكتوب بها التمرين.
+- ما تعطي حتى وعد، ولا موعد، ولا تهضر على الفلوس. قول "غنرجع ليك" فهاد الحالات.
+- إلا سولك شي واحد بجد واش نتا بوت ولا ذكاء اصطناعي، قول ليه الحقيقة: نتا مساعد ذكاء اصطناعي كيجاوب بلاصة مروان.`;
 
 let enabled = true;
 const histories = {};
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
-async function askGemini(history) {
+async function askGemini(contents) {
   for (const model of MODELS) {
     try {
       const res = await ai.models.generateContent({
         model: model,
-        contents: history,
+        contents: contents,
         config: { systemInstruction: SYSTEM },
       });
       return res.text;
@@ -38,7 +45,7 @@ async function askGemini(history) {
 
 async function start() {
   const { state, saveCreds } = await useMultiFileAuthState("auth");
-  const sock = makeWASocket({ auth: state, logger: pino({ level: "silent" }) });
+  const sock = makeWASocket({ auth: state, logger: logger });
 
   if (!sock.authState.creds.registered) {
     setTimeout(async () => {
@@ -69,9 +76,11 @@ async function start() {
     const jid = m.key.remoteJid;
     if (jid.endsWith("@g.us") || jid === "status@broadcast") return;
 
+    const msg = m.message;
+    const img = msg.imageMessage;
     const text =
-      m.message.conversation || m.message.extendedTextMessage?.text;
-    if (!text) return;
+      msg.conversation || msg.extendedTextMessage?.text || img?.caption || "";
+    if (!text && !img) return;
 
     if (m.key.fromMe) {
       if (text === ".stop") {
@@ -87,19 +96,44 @@ async function start() {
 
     if (!enabled) return;
 
+    const parts = [];
+    if (img) {
+      try {
+        const buffer = await downloadMediaMessage(
+          m,
+          "buffer",
+          {},
+          { logger: logger, reuploadRequest: sock.updateMediaMessage }
+        );
+        parts.push({
+          inlineData: {
+            mimeType: img.mimetype || "image/jpeg",
+            data: buffer.toString("base64"),
+          },
+        });
+      } catch (e) {
+        console.error("IMAGE ERROR:", e.message);
+        await sock.sendMessage(jid, {
+          text: "ما قدرتش نحل الصورة، عاود صيفطها 🙏",
+        });
+        return;
+      }
+    }
+    parts.push({ text: text || "حل ليا هاد التمرين لي فـ الصورة." });
+
     const history = (histories[jid] ||= []);
-    history.push({ role: "user", parts: [{ text: text }] });
+    await sock.sendPresenceUpdate("composing", jid);
+    const answer = await askGemini([...history, { role: "user", parts: parts }]);
+
+    if (!answer) return;
+
+    history.push({
+      role: "user",
+      parts: [{ text: img ? "[صورة] " + text : text }],
+    });
+    history.push({ role: "model", parts: [{ text: answer }] });
     history.splice(0, Math.max(0, history.length - 20));
 
-    await sock.sendPresenceUpdate("composing", jid);
-    const answer = await askGemini(history);
-
-    if (!answer) {
-      history.pop();
-      return;
-    }
-
-    history.push({ role: "model", parts: [{ text: answer }] });
     await sleep(2000 + Math.random() * 3000);
     await sock.sendMessage(jid, { text: answer });
   });
