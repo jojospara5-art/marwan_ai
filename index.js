@@ -83,10 +83,9 @@ async function start() {
       history.push({ role: "model", parts: [{ text: res.text }] });
       await sleep(2000 + Math.random() * 3000);
       await sock.sendMessage(jid, { text: res.text });
-        } catch (e) {
+    } catch (e) {
       console.error("ERROR:", e.message);
       history.pop();
-    }
     }
   });
 }
