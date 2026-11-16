@@ -11,11 +11,12 @@ const pino = require("pino");
 
 const logger = pino({ level: "silent" });
 const ai = new GoogleGenAI({ apiKey: process.env.GEMINI_API_KEY });
-const MODELS = ["gemini-3.5-flash", "gemini-2.5-flash", "gemini-2.5-flash-lite"];
+const MODELS = ["gemini-2.5-flash", "gemini-2.5-flash-lite", "gemini-3.5-flash"];
 const MAX_FILE = 15 * 1024 * 1024;
 const DATA_FILE = "auth/memory.json";
 const YTDLP = "/tmp/yt-dlp";
 const IG_REGEX = /https?:\/\/(?:www\.)?instagram\.com\/(?:reels?|p|tv)\/[\w-]+\S*/i;
+const LIMIT_PER_HOUR = 30;
 
 let data = { users: {} };
 try {
@@ -35,6 +36,14 @@ function saveData() {
 function getUser(jid) {
   if (!data.users[jid]) data.users[jid] = { memory: [], notes: [] };
   return data.users[jid];
+}
+
+const hits = {};
+function overLimit(jid) {
+  const now = Date.now();
+  const arr = (hits[jid] = (hits[jid] || []).filter((t) => now - t < 3600000));
+  arr.push(now);
+  return arr.length > LIMIT_PER_HOUR;
 }
 
 const str = (d) => ({ type: Type.STRING, description: d });
@@ -152,6 +161,7 @@ async function askGemini(jid, contents) {
         }
       } catch (e) {
         console.error("ERROR with " + model + " tools#" + i + ":", e.message);
+        if (String(e.message).includes("429")) break;
       }
     }
   }
@@ -288,6 +298,15 @@ async function start() {
 
     if (!enabled) return;
 
+    if (overLimit(jid)) {
+      if (hits[jid].length === LIMIT_PER_HOUR + 1) {
+        await sock.sendMessage(jid, {
+          text: "صيفطتي بزاف ديال الرسائل، عاود من بعد شوية 🙏",
+        });
+      }
+      return;
+    }
+
     const igMatch = text.match(IG_REGEX);
     if (igMatch && !img && !video && !doc && !audio) {
       await sock.sendPresenceUpdate("composing", jid);
@@ -349,7 +368,13 @@ async function start() {
     const history = (histories[jid] ||= []);
     await sock.sendPresenceUpdate("composing", jid);
     const answer = await askGemini(jid, [...history, { role: "user", parts: parts }]);
-    if (!answer) return;
+
+    if (!answer) {
+      await sock.sendMessage(jid, {
+        text: "البوت مشغول دابا، عاود صيفط من بعد دقيقة 🙏",
+      });
+      return;
+    }
 
     history.push({ role: "user", parts: [{ text: label + prompt }] });
     history.push({ role: "model", parts: [{ text: answer }] });
