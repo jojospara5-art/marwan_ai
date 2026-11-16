@@ -12,14 +12,11 @@ const pino = require("pino");
 const logger = pino({ level: "silent" });
 const ai = new GoogleGenAI({ apiKey: process.env.GEMINI_API_KEY });
 const MODELS = ["gemini-3.5-flash", "gemini-2.5-flash", "gemini-2.5-flash-lite"];
-const IMAGE_MODELS = ["gemini-2.5-flash-image", "gemini-3.1-flash-image"];
-const MAX_FILE_BYTES = 15 * 1024 * 1024;
+const MAX_FILE = 15 * 1024 * 1024;
 const DATA_FILE = "auth/memory.json";
-const YTDLP_PATH = "/tmp/yt-dlp";
-const IG_REGEX =
-  /https?:\/\/(?:www\.)?instagram\.com\/(?:reels?|p|tv)\/[\w-]+\S*/i;
+const YTDLP = "/tmp/yt-dlp";
+const IG_REGEX = /https?:\/\/(?:www\.)?instagram\.com\/(?:reels?|p|tv)\/[\w-]+\S*/i;
 
-// ---------- التخزين ----------
 let data = { users: {} };
 try {
   data = JSON.parse(fs.readFileSync(DATA_FILE, "utf8"));
@@ -40,53 +37,18 @@ function getUser(jid) {
   return data.users[jid];
 }
 
-// ---------- الأدوات ديال Gemini ----------
+const str = (d) => ({ type: Type.STRING, description: d });
+const fn = (name, description, props, required) => ({
+  name: name,
+  description: description,
+  parameters: { type: Type.OBJECT, properties: props, required: required },
+});
+
 const FUNCTIONS = [
-  {
-    name: "remember_fact",
-    description:
-      "حفظ معلومة ثابتة على هاد الشخص (الاسم، شنو كيحب، الدراسة، الخدمة، الأهداف...) باش تتذكرها فـ المحادثات الجاية. ما تحفظش كلمات سر، أرقام بطاقات، معلومات صحية ولا مالية.",
-    parameters: {
-      type: Type.OBJECT,
-      properties: {
-        fact: { type: Type.STRING, description: "المعلومة فـ جملة قصيرة" },
-      },
-      required: ["fact"],
-    },
-  },
-  {
-    name: "forget_fact",
-    description: "مسح معلومة محفوظة على هاد الشخص، فاش يطلب هو هادشي.",
-    parameters: {
-      type: Type.OBJECT,
-      properties: {
-        keyword: { type: Type.STRING, description: "كلمة من المعلومة اللي تمسح" },
-      },
-      required: ["keyword"],
-    },
-  },
-  {
-    name: "add_note",
-    description: "تسجيل ملاحظة ولا مهمة فـ دفتر هاد الشخص، فاش يطلب هو هادشي.",
-    parameters: {
-      type: Type.OBJECT,
-      properties: {
-        text: { type: Type.STRING, description: "نص الملاحظة" },
-      },
-      required: ["text"],
-    },
-  },
-  {
-    name: "delete_note",
-    description: "مسح ملاحظة من الدفتر بالنمرة ديالها (من 1).",
-    parameters: {
-      type: Type.OBJECT,
-      properties: {
-        number: { type: Type.INTEGER, description: "نمرة الملاحظة" },
-      },
-      required: ["number"],
-    },
-  },
+  fn("remember_fact", "حفظ معلومة ثابتة على الشخص (ماشي كلمات سر ولا صحة ولا فلوس)", { fact: str("المعلومة") }, ["fact"]),
+  fn("forget_fact", "مسح معلومة محفوظة", { keyword: str("كلمة من المعلومة") }, ["keyword"]),
+  fn("add_note", "تسجيل ملاحظة فـ دفتر الشخص", { text: str("النص") }, ["text"]),
+  fn("delete_note", "مسح ملاحظة بالنمرة (من 1)", { number: { type: Type.INTEGER, description: "النمرة" } }, ["number"]),
 ];
 
 const TOOLSETS = [
@@ -96,79 +58,62 @@ const TOOLSETS = [
   [],
 ];
 
-function runTool(jid, name, args) {
+function runTool(jid, name, a) {
   const u = getUser(jid);
   if (name === "remember_fact") {
-    const fact = String(args.fact || "").trim().slice(0, 300);
-    if (!fact) return { ok: false };
-    if (!u.memory.includes(fact)) u.memory.push(fact);
+    const f = String(a.fact || "").trim().slice(0, 300);
+    if (!f) return { ok: false };
+    if (!u.memory.includes(f)) u.memory.push(f);
     u.memory = u.memory.slice(-50);
-    saveData();
-    return { ok: true };
-  }
-  if (name === "forget_fact") {
-    const k = String(args.keyword || "").trim();
+  } else if (name === "forget_fact") {
+    const k = String(a.keyword || "").trim();
     if (!k) return { ok: false };
-    const before = u.memory.length;
-    u.memory = u.memory.filter((f) => !f.includes(k));
-    saveData();
-    return { ok: true, removed: before - u.memory.length };
-  }
-  if (name === "add_note") {
-    const t = String(args.text || "").trim().slice(0, 500);
+    u.memory = u.memory.filter((x) => !x.includes(k));
+  } else if (name === "add_note") {
+    const t = String(a.text || "").trim().slice(0, 500);
     if (!t) return { ok: false };
-    if (!u.notes.includes(t)) u.notes.push(t);
+    u.notes.push(t);
     u.notes = u.notes.slice(-100);
-    saveData();
-    return { ok: true, total: u.notes.length };
-  }
-  if (name === "delete_note") {
-    const n = Number(args.number);
+  } else if (name === "delete_note") {
+    const n = Number(a.number);
     if (!n || n < 1 || n > u.notes.length) return { ok: false };
     u.notes.splice(n - 1, 1);
-    saveData();
-    return { ok: true };
+  } else {
+    return { ok: false };
   }
-  return { ok: false };
+  saveData();
+  return { ok: true };
 }
 
-// ---------- البرومبت ----------
 function systemPrompt(jid) {
   const today = new Date().toISOString().slice(0, 10);
   const u = getUser(jid);
-  const memoryText = u.memory.length
-    ? u.memory.map((f) => "- " + f).join("\n")
-    : "(مازال ما كاين والو)";
-  const notesText = u.notes.length
-    ? u.notes.map((n, i) => i + 1 + ". " + n).join("\n")
-    : "(الدفتر خاوي)";
+  const mem = u.memory.length ? u.memory.map((f) => "- " + f).join("\n") : "(والو)";
+  const notes = u.notes.length ? u.notes.map((n, i) => i + 1 + ". " + n).join("\n") : "(خاوي)";
   return `نتا كتجاوب بلاصة مروان فـ واتساب. تاريخ اليوم: ${today}.
 نتا شخص مثقف وذكي بزاف وكتفهم فـ كلشي: دراسة، لغات، علوم، رياضيات، تقنية، دين، فلسفة، حياة، نصائح.
 
 قواعد الجواب:
 - جاوب بدقة ومعلومات صحيحة. إلا ما كنتيش متأكد قول "ما متأكدش" وما تخترعش.
 - فـ الدردشة العادية: هضر بالدارجة المغربية بحال شاب، بجمل قصيرة وعفوية.
-- فـ النقاش: دافع على رأيك بحجج منطقية وأمثلة وأرقام، فكك حجج الطرف الآخر بهدوء ونقطة نقطة، وكون مقنع. بلا كذب وبلا تلاعب، وإلا كان الطرف الآخر عندو الحق، اعترف بهادشي.
-- فـ الرياضيات والحسابات: استعمل تنفيذ الكود باش يكون الجواب دقيق، وشرح الخطوات.
-- فـ الأسئلة الصعيبة والتمارين: فكر مزيان، وحل خطوة خطوة، وعطي الجواب النهائي بوضوح.
-- إلا جاتك صورة: قراها وحل ما فيها كامل. إلا جاك فويس: سمعو وجاوب على لي قال. إلا جاك فيديو ولا PDF: فهمو ولخصو وجاوب على لي طلب.
-- إلا طلب منك شي واحد أغنية: استعمل البحث وجيب ليه سمية الأغنية والفنان ورابط يوتيوب الرسمي الحقيقي ديالها (ماشي رابط مخترع). ما كتصيفطش ملف الصوت. إلا ما لقيتيش الرابط، عطيه رابط البحث: https://www.youtube.com/results?search_query=سمية+الأغنية+الفنان
-- إلا بغى يراجع درس ولا يفهمو: شرحو ليه بالدارجة خطوة خطوة بأمثلة بسيطة، ولخصو فـ نقط، وصاوب ليه أسئلة تدريب وصححها ليه، وكرر الصعيب بطريقة أخرى. إلا صيفط ليك صورة ولا PDF ديال الدرس، قراه ودرسو منو.
+- فـ النقاش: دافع على رأيك بحجج منطقية وأمثلة وأرقام، فكك حجج الطرف الآخر بهدوء، وكون مقنع بلا كذب ولا تلاعب. إلا كان عندو الحق، اعترف.
+- فـ الرياضيات والحسابات: استعمل تنفيذ الكود باش يكون الجواب دقيق.
+- فـ التمارين والأسئلة الصعيبة: حل خطوة خطوة وشرح، وعطي الجواب النهائي بوضوح.
+- إلا جاتك صورة: قراها وحل ما فيها. إلا جاك فويس: سمعو وجاوب. إلا جاك فيديو ولا PDF: فهمو ولخصو وجاوب على لي طلب.
+- إلا طلب منك أغنية: استعمل البحث وجيب سمية الأغنية والفنان ورابط يوتيوب الرسمي الحقيقي (ماشي مخترع). ما كتصيفطش ملف الصوت. إلا ما لقيتيش الرابط، عطيه: https://www.youtube.com/results?search_query=سمية+الأغنية+الفنان
+- إلا بغى يراجع درس: شرحو بالدارجة خطوة خطوة بأمثلة بسيطة، ولخصو فـ نقط، وصاوب ليه أسئلة تدريب وصححها ليه. إلا صيفط صورة ولا PDF ديال الدرس، قراه ودرسو منو.
 - إلا سولك على شي حاجة جديدة ولا أخبار، استعمل البحث.
 - جاوب بنفس اللغة اللي كيهضر بها الشخص.
-- ما تعطي حتى وعد، ولا موعد، ولا تهضر على الفلوس. قول "غنرجع ليك" فهاد الحالات.
-- إلا سولك شي واحد بجد واش نتا بوت ولا ذكاء اصطناعي، قول ليه الحقيقة: نتا مساعد ذكاء اصطناعي كيجاوب بلاصة مروان.
+- ما تعطي وعد ولا موعد ولا تهضر على الفلوس. قول "غنرجع ليك".
+- إلا سولك شي واحد بجد واش نتا بوت، قول ليه الحقيقة: نتا مساعد ذكاء اصطناعي كيجاوب بلاصة مروان.
 
-الذاكرة:
-- هادشي لي عارف على هاد الشخص (هو وحدو، ما تكشفو لحتى واحد آخر):
-${memoryText}
-- الدفتر ديالو:
-${notesText}
-- إلا قال شي حاجة ثابتة على راسو (سميتو، دراستو، شنو كيحب، أهدافو...) ولا طلب منك تتفكر شي حاجة: استعمل remember_fact.
-- إلا طلب منك تنسى شي حاجة: forget_fact.
-- إلا طلب منك تسجل ملاحظة ولا مهمة: add_note. وإلا بغى يمسح وحدة: delete_note.
-- ما تحفظ حتى كلمة سر، رقم بطاقة، رقم هوية، معلومات صحية ولا مالية.
-- ملي تحفظ شي حاجة، قولها ليه بجملة وحدة قصيرة.`;
+الذاكرة (على هاد الشخص وحدو، ما تكشفها لحتى واحد آخر):
+${mem}
+الدفتر ديالو:
+${notes}
+- إلا قال شي حاجة ثابتة على راسو ولا طلب منك تتفكر: remember_fact. تنسى: forget_fact. ملاحظة ولا مهمة: add_note. مسح ملاحظة: delete_note.
+- ما تحفظ كلمة سر ولا رقم بطاقة ولا هوية ولا معلومات صحية ولا مالية.
+- ملي تحفظ شي حاجة، قولها بجملة وحدة قصيرة.`;
 }
 
 let enabled = true;
@@ -191,13 +136,15 @@ async function askGemini(jid, contents) {
           const calls = res.functionCalls;
           if (calls && calls.length > 0) {
             convo.push(res.candidates[0].content);
-            const responseParts = calls.map((c) => ({
-              functionResponse: {
-                name: c.name,
-                response: { result: runTool(jid, c.name, c.args || {}) },
-              },
-            }));
-            convo.push({ role: "user", parts: responseParts });
+            convo.push({
+              role: "user",
+              parts: calls.map((c) => ({
+                functionResponse: {
+                  name: c.name,
+                  response: { result: runTool(jid, c.name, c.args || {}) },
+                },
+              })),
+            });
             continue;
           }
           if (res.text) return res.text;
@@ -211,35 +158,15 @@ async function askGemini(jid, contents) {
   return null;
 }
 
-async function generateImage(prompt) {
-  for (const model of IMAGE_MODELS) {
-    try {
-      const res = await ai.models.generateContent({
-        model: model,
-        contents: [{ parts: [{ text: prompt }] }],
-        config: { responseModalities: ["TEXT", "IMAGE"] },
-      });
-      const part = res.candidates?.[0]?.content?.parts?.find(
-        (p) => p.inlineData
-      );
-      if (part) return Buffer.from(part.inlineData.data, "base64");
-    } catch (e) {
-      console.error("IMAGE GEN ERROR with " + model + ":", e.message);
-    }
-  }
-  return null;
-}
-
-// ---------- تحميل فيديو إنستغرام ----------
 async function ensureYtDlp() {
-  if (fs.existsSync(YTDLP_PATH)) return true;
+  if (fs.existsSync(YTDLP)) return true;
   try {
     const res = await fetch(
       "https://github.com/yt-dlp/yt-dlp/releases/latest/download/yt-dlp_linux"
     );
     if (!res.ok) throw new Error("HTTP " + res.status);
-    fs.writeFileSync(YTDLP_PATH, Buffer.from(await res.arrayBuffer()));
-    fs.chmodSync(YTDLP_PATH, 0o755);
+    fs.writeFileSync(YTDLP, Buffer.from(await res.arrayBuffer()));
+    fs.chmodSync(YTDLP, 0o755);
     return true;
   } catch (e) {
     console.error("YTDLP DOWNLOAD ERROR:", e.message);
@@ -251,17 +178,10 @@ function runYtDlp(url) {
   return new Promise((resolve, reject) => {
     const base = "ig_" + Date.now();
     const args = [
-      "--no-playlist",
-      "--no-warnings",
-      "--max-filesize",
-      "40M",
-      "-f",
-      "b[ext=mp4]/b",
-      "-o",
-      "/tmp/" + base + ".%(ext)s",
-      url,
+      "--no-playlist", "--no-warnings", "--max-filesize", "40M",
+      "-f", "b[ext=mp4]/b", "-o", "/tmp/" + base + ".%(ext)s", url,
     ];
-    const p = spawn(YTDLP_PATH, args);
+    const p = spawn(YTDLP, args);
     let err = "";
     p.stderr.on("data", (d) => (err += d));
     const timer = setTimeout(() => p.kill(), 90000);
@@ -274,9 +194,8 @@ function runYtDlp(url) {
       if (code !== 0) return reject(new Error(err.slice(-300) || "exit " + code));
       const file = fs.readdirSync("/tmp").find((f) => f.startsWith(base + "."));
       if (!file) return reject(new Error("no file"));
-      const full = "/tmp/" + file;
-      const buf = fs.readFileSync(full);
-      fs.rmSync(full, { force: true });
+      const buf = fs.readFileSync("/tmp/" + file);
+      fs.rmSync("/tmp/" + file, { force: true });
       resolve(buf);
     });
   });
@@ -327,7 +246,7 @@ async function start() {
 
   sock.ev.on("messages.upsert", async ({ messages }) => {
     const m = messages[0];
-    if (!m.message) return;
+    if (!m || !m.message) return;
     const jid = m.key.remoteJid;
     if (jid.endsWith("@g.us") || jid === "status@broadcast") return;
 
@@ -338,65 +257,46 @@ async function start() {
     const doc =
       msg.documentMessage ||
       msg.documentWithCaptionMessage?.message?.documentMessage;
-    const caption = img?.caption || video?.caption || doc?.caption || "";
     const text =
-      msg.conversation || msg.extendedTextMessage?.text || caption || "";
+      msg.conversation ||
+      msg.extendedTextMessage?.text ||
+      img?.caption ||
+      video?.caption ||
+      doc?.caption ||
+      "";
     if (!text && !img && !audio && !video && !doc) return;
 
     if (m.key.fromMe) {
+      let reply = "";
       if (text === ".stop") {
         enabled = false;
-        await sock.sendMessage(jid, { text: "⏸️ البوت وقف" });
-      }
-      if (text === ".start") {
+        reply = "⏸️ البوت وقف";
+      } else if (text === ".start") {
         enabled = true;
-        await sock.sendMessage(jid, { text: "▶️ البوت خدام" });
-      }
-      if (text === ".reset") {
+        reply = "▶️ البوت خدام";
+      } else if (text === ".reset") {
         for (const k of Object.keys(histories)) delete histories[k];
-        await sock.sendMessage(jid, { text: "🧹 تمسحات المحادثات الأخيرة" });
-      }
-      if (text === ".wipe") {
+        reply = "🧹 تمسحات المحادثات الأخيرة";
+      } else if (text === ".wipe") {
         data = { users: {} };
         saveData();
-        await sock.sendMessage(jid, {
-          text: "🗑️ تمسحات الذاكرة والملاحظات ديال الكل",
-        });
+        reply = "🗑️ تمسحات الذاكرة والملاحظات ديال الكل";
       }
+      if (reply) await sock.sendMessage(jid, { text: reply });
       return;
     }
 
     if (!enabled) return;
 
-    // رابط إنستغرام
     const igMatch = text.match(IG_REGEX);
     if (igMatch && !img && !video && !doc && !audio) {
       await sock.sendPresenceUpdate("composing", jid);
       const buf = await downloadInstagram(igMatch[0]);
       if (buf) {
-        await sock.sendMessage(jid, {
-          video: buf,
-          mimetype: "video/mp4",
-          caption: "🎬",
-        });
+        await sock.sendMessage(jid, { video: buf, mimetype: "video/mp4", caption: "🎬" });
       } else {
         await sock.sendMessage(jid, {
           text: "ما قدرتش نحمل الفيديو. ممكن إنستغرام بلوكا الطلب، ولا الفيديو خاص، ولا كبير بزاف 🙏",
-        });
-      }
-      return;
-    }
-
-    // توليد صورة
-    const imgCmd = text.match(/^\.(?:img|صورة)\s+([\s\S]+)/);
-    if (imgCmd && !img && !video && !doc && !audio) {
-      await sock.sendPresenceUpdate("composing", jid);
-      const buf = await generateImage(imgCmd[1].trim());
-      if (buf) {
-        await sock.sendMessage(jid, { image: buf, caption: "🎨" });
-      } else {
-        await sock.sendMessage(jid, {
-          text: "ما قدرتش نصاوب الصورة دابا (غالبا هاد الميزة ماشي مجانية) 🙏",
         });
       }
       return;
@@ -418,19 +318,46 @@ async function start() {
           {},
           { logger: logger, reuploadRequest: sock.updateMediaMessage }
         );
-        if (buffer.length > MAX_FILE_BYTES) {
+        if (buffer.length > MAX_FILE) {
           await sock.sendMessage(jid, {
             text: "الملف كبير بزاف (أكثر من 15 MB)، صيفط شي حاجة أصغر 🙏",
           });
           return;
         }
-        const fallbackType = img
-          ? "image/jpeg"
-          : audio
-          ? "audio/ogg"
-          : video
-          ? "video/mp4"
-          : "application/pdf";
+        const fallback = img ? "image/jpeg" : audio ? "audio/ogg" : video ? "video/mp4" : "application/pdf";
         parts.push({
           inlineData: {
-            mimeType: (media.mimetype || fallbackType).split(";")[0],
+            mimeType: (media.mimetype || fallback).split(";")[0],
+            data: buffer.toString("base64"),
+          },
+        });
+        label = img ? "[صورة] " : audio ? "[فويس] " : video ? "[فيديو] " : "[PDF] ";
+      } catch (e) {
+        console.error("MEDIA ERROR:", e.message);
+        await sock.sendMessage(jid, { text: "ما قدرتش نحل الملف، عاود صيفطو 🙏" });
+        return;
+      }
+    }
+
+    let prompt = text;
+    if (!prompt && img) prompt = "حل ليا هاد التمرين لي فـ الصورة.";
+    if (!prompt && audio) prompt = "سمع هاد الفويس وجاوب على لي قال فيه.";
+    if (!prompt && video) prompt = "شوف هاد الفيديو ولخصو ليا.";
+    if (!prompt && doc) prompt = "لخص ليا هاد الملف وعطيني النقط المهمة فيه.";
+    parts.push({ text: prompt });
+
+    const history = (histories[jid] ||= []);
+    await sock.sendPresenceUpdate("composing", jid);
+    const answer = await askGemini(jid, [...history, { role: "user", parts: parts }]);
+    if (!answer) return;
+
+    history.push({ role: "user", parts: [{ text: label + prompt }] });
+    history.push({ role: "model", parts: [{ text: answer }] });
+    history.splice(0, Math.max(0, history.length - 20));
+
+    await sleep(1500 + Math.random() * 2500);
+    await sock.sendMessage(jid, { text: answer });
+  });
+}
+
+start();
