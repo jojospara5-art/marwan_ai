@@ -12,16 +12,23 @@ const logger = pino({ level: "silent" });
 const ai = new GoogleGenAI({ apiKey: process.env.GEMINI_API_KEY });
 const MODELS = ["gemini-3.5-flash", "gemini-2.5-flash", "gemini-2.5-flash-lite"];
 
-const SYSTEM = `نتا كتجاوب بلاصة مروان فـ واتساب، ونتا شخص مثقف وذكي بزاف وكتفهم فـ كلشي: دراسة، لغات، علوم، رياضيات، تقنية، دين، حياة، نصائح.
+function systemPrompt() {
+  const today = new Date().toISOString().slice(0, 10);
+  return `نتا كتجاوب بلاصة مروان فـ واتساب. تاريخ اليوم: ${today}.
+نتا شخص مثقف وذكي بزاف وكتفهم فـ كلشي: دراسة، لغات، علوم، رياضيات، تقنية، دين، فلسفة، حياة، نصائح.
 
 قواعد الجواب:
 - جاوب بدقة ومعلومات صحيحة. إلا ما كنتيش متأكد قول "ما متأكدش" وما تخترعش.
 - فـ الدردشة العادية: هضر بالدارجة المغربية بحال شاب، بجمل قصيرة وعفوية.
+- فـ النقاش: دافع على رأيك بحجج منطقية وأمثلة وأرقام، فكك حجج الطرف الآخر بهدوء ونقطة نقطة، وكون مقنع. بلا كذب وبلا تلاعب، وإلا كان الطرف الآخر عندو الحق، اعترف بهادشي.
 - فـ الأسئلة الصعيبة والتمارين: فكر مزيان، وحل خطوة خطوة، وشرح كل خطوة، وعطي الجواب النهائي بوضوح.
-- إلا جاتك صورة (تمرين، سؤال، نص): قراها مزيان، وحل ما فيها كامل. إلا كانت ما واضحاش قول للشخص يعاود يصيفطها.
-- جاوب بنفس اللغة اللي كيهضر بها الشخص ولا اللي مكتوب بها التمرين.
+- إلا جاتك صورة: قراها وحل ما فيها كامل. إلا جاك فويس: سمعو مزيان وجاوب على لي قال.
+- إلا طلب منك شي واحد أغنية: ما كتصيفطش الملف. عطيه سمية الأغنية والفنان، ورابط البحث فـ يوتيوب بهاد الشكل: https://www.youtube.com/results?search_query=سمية+الأغنية+الفنان
+- إلا سولك على شي حاجة جديدة ولا أخبار، استعمل البحث.
+- جاوب بنفس اللغة اللي كيهضر بها الشخص.
 - ما تعطي حتى وعد، ولا موعد، ولا تهضر على الفلوس. قول "غنرجع ليك" فهاد الحالات.
 - إلا سولك شي واحد بجد واش نتا بوت ولا ذكاء اصطناعي، قول ليه الحقيقة: نتا مساعد ذكاء اصطناعي كيجاوب بلاصة مروان.`;
+}
 
 let enabled = true;
 const histories = {};
@@ -29,15 +36,22 @@ const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
 async function askGemini(contents) {
   for (const model of MODELS) {
-    try {
-      const res = await ai.models.generateContent({
-        model: model,
-        contents: contents,
-        config: { systemInstruction: SYSTEM },
-      });
-      return res.text;
-    } catch (e) {
-      console.error("ERROR with " + model + ":", e.message);
+    for (const useSearch of [true, false]) {
+      try {
+        const config = { systemInstruction: systemPrompt() };
+        if (useSearch) config.tools = [{ googleSearch: {} }];
+        const res = await ai.models.generateContent({
+          model: model,
+          contents: contents,
+          config: config,
+        });
+        if (res.text) return res.text;
+      } catch (e) {
+        console.error(
+          "ERROR with " + model + (useSearch ? " +search" : "") + ":",
+          e.message
+        );
+      }
     }
   }
   return null;
@@ -78,9 +92,10 @@ async function start() {
 
     const msg = m.message;
     const img = msg.imageMessage;
+    const audio = msg.audioMessage;
     const text =
       msg.conversation || msg.extendedTextMessage?.text || img?.caption || "";
-    if (!text && !img) return;
+    if (!text && !img && !audio) return;
 
     if (m.key.fromMe) {
       if (text === ".stop") {
@@ -91,13 +106,18 @@ async function start() {
         enabled = true;
         await sock.sendMessage(jid, { text: "▶️ البوت خدام" });
       }
+      if (text === ".reset") {
+        for (const k of Object.keys(histories)) delete histories[k];
+        await sock.sendMessage(jid, { text: "🧹 تمسحات الذاكرة" });
+      }
       return;
     }
 
     if (!enabled) return;
 
     const parts = [];
-    if (img) {
+    const media = img || audio;
+    if (media) {
       try {
         const buffer = await downloadMediaMessage(
           m,
@@ -105,21 +125,26 @@ async function start() {
           {},
           { logger: logger, reuploadRequest: sock.updateMediaMessage }
         );
+        const fallbackType = img ? "image/jpeg" : "audio/ogg";
         parts.push({
           inlineData: {
-            mimeType: img.mimetype || "image/jpeg",
+            mimeType: (media.mimetype || fallbackType).split(";")[0],
             data: buffer.toString("base64"),
           },
         });
       } catch (e) {
-        console.error("IMAGE ERROR:", e.message);
+        console.error("MEDIA ERROR:", e.message);
         await sock.sendMessage(jid, {
-          text: "ما قدرتش نحل الصورة، عاود صيفطها 🙏",
+          text: "ما قدرتش نحل الملف، عاود صيفطو 🙏",
         });
         return;
       }
     }
-    parts.push({ text: text || "حل ليا هاد التمرين لي فـ الصورة." });
+
+    let prompt = text;
+    if (!prompt && img) prompt = "حل ليا هاد التمرين لي فـ الصورة.";
+    if (!prompt && audio) prompt = "سمع هاد الفويس وجاوب على لي قال فيه.";
+    parts.push({ text: prompt });
 
     const history = (histories[jid] ||= []);
     await sock.sendPresenceUpdate("composing", jid);
@@ -127,10 +152,8 @@ async function start() {
 
     if (!answer) return;
 
-    history.push({
-      role: "user",
-      parts: [{ text: img ? "[صورة] " + text : text }],
-    });
+    const label = img ? "[صورة] " : audio ? "[فويس] " : "";
+    history.push({ role: "user", parts: [{ text: label + prompt }] });
     history.push({ role: "model", parts: [{ text: answer }] });
     history.splice(0, Math.max(0, history.length - 20));
 
