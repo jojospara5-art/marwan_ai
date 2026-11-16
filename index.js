@@ -11,13 +11,18 @@ const pino = require("pino");
 
 const logger = pino({ level: "silent" });
 const ai = new GoogleGenAI({ apiKey: process.env.GEMINI_API_KEY });
+const GROQ_KEY = process.env.GROQ_API_KEY;
+const GROQ_MODELS = ["llama-3.3-70b-versatile", "llama-3.1-8b-instant"];
+const WHISPER_MODEL = "whisper-large-v3-turbo";
 const MODELS = ["gemini-2.5-flash", "gemini-2.5-flash-lite", "gemini-3.5-flash"];
 const MAX_FILE = 15 * 1024 * 1024;
 const DATA_FILE = "auth/memory.json";
 const YTDLP = "/tmp/yt-dlp";
 const IG_REGEX = /https?:\/\/(?:www\.)?instagram\.com\/(?:reels?|p|tv)\/[\w-]+\S*/i;
+const NEEDS_GEMINI = /أخبار|اخبار|نتيجة|نتائج|ثمن|سعر|أغنية|اغنية|أغاني|اغاني|طقس|مباراة|احسب|معادلة|مشتقة|تكامل|news|latest|price|score|weather|song|calculate|equation|integral/i;
 const LIMIT_PER_HOUR = 30;
 
+// ---------- التخزين ----------
 let data = { users: {} };
 try {
   data = JSON.parse(fs.readFileSync(DATA_FILE, "utf8"));
@@ -46,23 +51,44 @@ function overLimit(jid) {
   return arr.length > LIMIT_PER_HOUR;
 }
 
-const str = (d) => ({ type: Type.STRING, description: d });
-const fn = (name, description, props, required) => ({
-  name: name,
-  description: description,
-  parameters: { type: Type.OBJECT, properties: props, required: required },
-});
-
-const FUNCTIONS = [
-  fn("remember_fact", "حفظ معلومة ثابتة على الشخص (ماشي كلمات سر ولا صحة ولا فلوس)", { fact: str("المعلومة") }, ["fact"]),
-  fn("forget_fact", "مسح معلومة محفوظة", { keyword: str("كلمة من المعلومة") }, ["keyword"]),
-  fn("add_note", "تسجيل ملاحظة فـ دفتر الشخص", { text: str("النص") }, ["text"]),
-  fn("delete_note", "مسح ملاحظة بالنمرة (من 1)", { number: { type: Type.INTEGER, description: "النمرة" } }, ["number"]),
+// ---------- الأدوات (للجوج ديال المحركات) ----------
+const TOOL_DEFS = [
+  { name: "remember_fact", description: "حفظ معلومة ثابتة على الشخص (ماشي كلمات سر ولا صحة ولا فلوس)", props: { fact: ["string", "المعلومة"] }, required: ["fact"] },
+  { name: "forget_fact", description: "مسح معلومة محفوظة", props: { keyword: ["string", "كلمة من المعلومة"] }, required: ["keyword"] },
+  { name: "add_note", description: "تسجيل ملاحظة فـ دفتر الشخص", props: { text: ["string", "النص"] }, required: ["text"] },
+  { name: "delete_note", description: "مسح ملاحظة بالنمرة (من 1)", props: { number: ["integer", "النمرة"] }, required: ["number"] },
 ];
 
+function buildProps(defProps, upper) {
+  const out = {};
+  for (const k of Object.keys(defProps)) {
+    const kind = defProps[k][0];
+    out[k] = {
+      type: upper ? Type[kind.toUpperCase()] : kind,
+      description: defProps[k][1],
+    };
+  }
+  return out;
+}
+
+const GEM_FUNCTIONS = TOOL_DEFS.map((d) => ({
+  name: d.name,
+  description: d.description,
+  parameters: { type: Type.OBJECT, properties: buildProps(d.props, true), required: d.required },
+}));
+
+const GROQ_TOOLS = TOOL_DEFS.map((d) => ({
+  type: "function",
+  function: {
+    name: d.name,
+    description: d.description,
+    parameters: { type: "object", properties: buildProps(d.props, false), required: d.required },
+  },
+}));
+
 const TOOLSETS = [
-  [{ googleSearch: {} }, { codeExecution: {} }, { functionDeclarations: FUNCTIONS }],
-  [{ functionDeclarations: FUNCTIONS }],
+  [{ googleSearch: {} }, { codeExecution: {} }, { functionDeclarations: GEM_FUNCTIONS }],
+  [{ functionDeclarations: GEM_FUNCTIONS }],
   [{ googleSearch: {} }, { codeExecution: {} }],
   [],
 ];
@@ -94,11 +120,21 @@ function runTool(jid, name, a) {
   return { ok: true };
 }
 
-function systemPrompt(jid) {
+// ---------- البرومبت ----------
+function systemPrompt(jid, lite) {
   const today = new Date().toISOString().slice(0, 10);
   const u = getUser(jid);
   const mem = u.memory.length ? u.memory.map((f) => "- " + f).join("\n") : "(والو)";
   const notes = u.notes.length ? u.notes.map((n, i) => i + 1 + ". " + n).join("\n") : "(خاوي)";
+  const searchLine = lite
+    ? "- ما عندكش بحث ولا أنترنت. إلا سولك على أخبار جديدة ولا أثمنة ولا شي حاجة كتبدل، قول ليه ما عندكش معلومات محينة."
+    : "- إلا سولك على شي حاجة جديدة ولا أخبار، استعمل البحث.";
+  const mathLine = lite
+    ? "- فـ الحسابات: دير الحساب خطوة خطوة وراجعو مزيان قبل ما تعطي الجواب."
+    : "- فـ الرياضيات والحسابات: استعمل تنفيذ الكود باش يكون الجواب دقيق.";
+  const songLine = lite
+    ? "- إلا طلب منك أغنية: عطيه سمية الأغنية والفنان ورابط البحث: https://www.youtube.com/results?search_query=سمية+الأغنية+الفنان . ما تخترعش روابط."
+    : "- إلا طلب منك أغنية: استعمل البحث وجيب سمية الأغنية والفنان ورابط يوتيوب الرسمي الحقيقي (ماشي مخترع). ما كتصيفطش ملف الصوت. إلا ما لقيتيش الرابط، عطيه: https://www.youtube.com/results?search_query=سمية+الأغنية+الفنان";
   return `نتا كتجاوب بلاصة مروان فـ واتساب. تاريخ اليوم: ${today}.
 نتا شخص مثقف وذكي بزاف وكتفهم فـ كلشي: دراسة، لغات، علوم، رياضيات، تقنية، دين، فلسفة، حياة، نصائح.
 
@@ -106,12 +142,12 @@ function systemPrompt(jid) {
 - جاوب بدقة ومعلومات صحيحة. إلا ما كنتيش متأكد قول "ما متأكدش" وما تخترعش.
 - فـ الدردشة العادية: هضر بالدارجة المغربية بحال شاب، بجمل قصيرة وعفوية.
 - فـ النقاش: دافع على رأيك بحجج منطقية وأمثلة وأرقام، فكك حجج الطرف الآخر بهدوء، وكون مقنع بلا كذب ولا تلاعب. إلا كان عندو الحق، اعترف.
-- فـ الرياضيات والحسابات: استعمل تنفيذ الكود باش يكون الجواب دقيق.
+${mathLine}
 - فـ التمارين والأسئلة الصعيبة: حل خطوة خطوة وشرح، وعطي الجواب النهائي بوضوح.
-- إلا جاتك صورة: قراها وحل ما فيها. إلا جاك فويس: سمعو وجاوب. إلا جاك فيديو ولا PDF: فهمو ولخصو وجاوب على لي طلب.
-- إلا طلب منك أغنية: استعمل البحث وجيب سمية الأغنية والفنان ورابط يوتيوب الرسمي الحقيقي (ماشي مخترع). ما كتصيفطش ملف الصوت. إلا ما لقيتيش الرابط، عطيه: https://www.youtube.com/results?search_query=سمية+الأغنية+الفنان
-- إلا بغى يراجع درس: شرحو بالدارجة خطوة خطوة بأمثلة بسيطة، ولخصو فـ نقط، وصاوب ليه أسئلة تدريب وصححها ليه. إلا صيفط صورة ولا PDF ديال الدرس، قراه ودرسو منو.
-- إلا سولك على شي حاجة جديدة ولا أخبار، استعمل البحث.
+- إلا جاتك صورة: قراها وحل ما فيها. إلا جاك فويس: جاوب على لي قال. إلا جاك فيديو ولا PDF: فهمو ولخصو وجاوب على لي طلب.
+${songLine}
+- إلا بغى يراجع درس: شرحو بالدارجة خطوة خطوة بأمثلة بسيطة، ولخصو فـ نقط، وصاوب ليه أسئلة تدريب وصححها ليه.
+${searchLine}
 - جاوب بنفس اللغة اللي كيهضر بها الشخص.
 - ما تعطي وعد ولا موعد ولا تهضر على الفلوس. قول "غنرجع ليك".
 - إلا سولك شي واحد بجد واش نتا بوت، قول ليه الحقيقة: نتا مساعد ذكاء اصطناعي كيجاوب بلاصة مروان.
@@ -129,12 +165,107 @@ let enabled = true;
 const histories = {};
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
+// ---------- Groq ----------
+async function groqChat(body) {
+  const res = await fetch("https://api.groq.com/openai/v1/chat/completions", {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+      Authorization: "Bearer " + GROQ_KEY,
+    },
+    body: JSON.stringify(body),
+  });
+  if (!res.ok) {
+    throw new Error("HTTP " + res.status + " " + (await res.text()).slice(0, 200));
+  }
+  return res.json();
+}
+
+async function askGroq(jid, history, userText) {
+  if (!GROQ_KEY) return null;
+  for (const model of GROQ_MODELS) {
+    try {
+      const messages = [
+        { role: "system", content: systemPrompt(jid, true) },
+        ...history.map((h) => ({ role: h.role, content: h.content })),
+        { role: "user", content: userText },
+      ];
+      for (let step = 0; step < 4; step++) {
+        const out = await groqChat({
+          model: model,
+          messages: messages,
+          tools: GROQ_TOOLS,
+          tool_choice: "auto",
+          temperature: 0.7,
+        });
+        const msg = out.choices[0].message;
+        if (msg.tool_calls && msg.tool_calls.length > 0) {
+          messages.push({
+            role: "assistant",
+            content: msg.content || "",
+            tool_calls: msg.tool_calls,
+          });
+          for (const tc of msg.tool_calls) {
+            let args = {};
+            try {
+              args = JSON.parse(tc.function.arguments || "{}");
+            } catch (e) {}
+            const result = runTool(jid, tc.function.name, args);
+            messages.push({
+              role: "tool",
+              tool_call_id: tc.id,
+              content: JSON.stringify(result),
+            });
+          }
+          continue;
+        }
+        if (msg.content) return msg.content;
+        break;
+      }
+    } catch (e) {
+      console.error("GROQ ERROR with " + model + ":", e.message);
+    }
+  }
+  return null;
+}
+
+async function transcribe(buffer, mime) {
+  if (!GROQ_KEY) return null;
+  try {
+    const form = new FormData();
+    form.append("file", new Blob([buffer], { type: mime || "audio/ogg" }), "voice.ogg");
+    form.append("model", WHISPER_MODEL);
+    form.append("response_format", "json");
+    const res = await fetch("https://api.groq.com/openai/v1/audio/transcriptions", {
+      method: "POST",
+      headers: { Authorization: "Bearer " + GROQ_KEY },
+      body: form,
+    });
+    if (!res.ok) {
+      throw new Error("HTTP " + res.status + " " + (await res.text()).slice(0, 200));
+    }
+    const j = await res.json();
+    return (j.text || "").trim() || null;
+  } catch (e) {
+    console.error("WHISPER ERROR:", e.message);
+    return null;
+  }
+}
+
+// ---------- Gemini ----------
+function geminiHistory(history) {
+  return history.map((h) => ({
+    role: h.role === "assistant" ? "model" : "user",
+    parts: [{ text: h.content }],
+  }));
+}
+
 async function askGemini(jid, contents) {
   for (const model of MODELS) {
     for (let i = 0; i < TOOLSETS.length; i++) {
       try {
         const convo = [...contents];
-        const config = { systemInstruction: systemPrompt(jid) };
+        const config = { systemInstruction: systemPrompt(jid, false) };
         if (TOOLSETS[i].length > 0) config.tools = TOOLSETS[i];
         for (let step = 0; step < 4; step++) {
           const res = await ai.models.generateContent({
@@ -160,7 +291,7 @@ async function askGemini(jid, contents) {
           break;
         }
       } catch (e) {
-        console.error("ERROR with " + model + " tools#" + i + ":", e.message);
+        console.error("GEMINI ERROR with " + model + " tools#" + i + ":", e.message);
         if (String(e.message).includes("429")) break;
       }
     }
@@ -168,6 +299,7 @@ async function askGemini(jid, contents) {
   return null;
 }
 
+// ---------- إنستغرام ----------
 async function ensureYtDlp() {
   if (fs.existsSync(YTDLP)) return true;
   try {
@@ -221,6 +353,7 @@ async function downloadInstagram(url) {
   }
 }
 
+// ---------- البوت ----------
 async function start() {
   const { state, saveCreds } = await useMultiFileAuthState("auth");
   const sock = makeWASocket({ auth: state, logger: logger });
@@ -329,6 +462,9 @@ async function start() {
     const parts = [];
     const media = img || audio || video || doc;
     let label = "";
+    let prompt = text;
+    let transcribed = false;
+
     if (media) {
       try {
         const buffer = await downloadMediaMessage(
@@ -344,13 +480,19 @@ async function start() {
           return;
         }
         const fallback = img ? "image/jpeg" : audio ? "audio/ogg" : video ? "video/mp4" : "application/pdf";
-        parts.push({
-          inlineData: {
-            mimeType: (media.mimetype || fallback).split(";")[0],
-            data: buffer.toString("base64"),
-          },
-        });
+        const mime = (media.mimetype || fallback).split(";")[0];
         label = img ? "[صورة] " : audio ? "[فويس] " : video ? "[فيديو] " : "[PDF] ";
+
+        if (audio) {
+          const t = await transcribe(buffer, mime);
+          if (t) {
+            transcribed = true;
+            prompt = t;
+          }
+        }
+        if (!transcribed) {
+          parts.push({ inlineData: { mimeType: mime, data: buffer.toString("base64") } });
+        }
       } catch (e) {
         console.error("MEDIA ERROR:", e.message);
         await sock.sendMessage(jid, { text: "ما قدرتش نحل الملف، عاود صيفطو 🙏" });
@@ -358,7 +500,6 @@ async function start() {
       }
     }
 
-    let prompt = text;
     if (!prompt && img) prompt = "حل ليا هاد التمرين لي فـ الصورة.";
     if (!prompt && audio) prompt = "سمع هاد الفويس وجاوب على لي قال فيه.";
     if (!prompt && video) prompt = "شوف هاد الفيديو ولخصو ليا.";
@@ -367,7 +508,27 @@ async function start() {
 
     const history = (histories[jid] ||= []);
     await sock.sendPresenceUpdate("composing", jid);
-    const answer = await askGemini(jid, [...history, { role: "user", parts: parts }]);
+
+    const needsGemini = (media && !transcribed) || NEEDS_GEMINI.test(prompt);
+    let answer = null;
+    let engine = "";
+
+    if (!needsGemini) {
+      answer = await askGroq(jid, history, prompt);
+      if (answer) engine = "groq";
+    }
+    if (!answer) {
+      answer = await askGemini(jid, [
+        ...geminiHistory(history),
+        { role: "user", parts: parts },
+      ]);
+      if (answer) engine = "gemini";
+    }
+    if (!answer && needsGemini && !(media && !transcribed)) {
+      answer = await askGroq(jid, history, prompt);
+      if (answer) engine = "groq-fallback";
+    }
+    console.log("ANSWER via", engine || "none");
 
     if (!answer) {
       await sock.sendMessage(jid, {
@@ -376,8 +537,8 @@ async function start() {
       return;
     }
 
-    history.push({ role: "user", parts: [{ text: label + prompt }] });
-    history.push({ role: "model", parts: [{ text: answer }] });
+    history.push({ role: "user", content: label + prompt });
+    history.push({ role: "assistant", content: answer });
     history.splice(0, Math.max(0, history.length - 20));
 
     await sleep(1500 + Math.random() * 2500);
