@@ -12,9 +12,16 @@ const pino = require("pino");
 const logger = pino({ level: "silent" });
 const ai = new GoogleGenAI({ apiKey: process.env.GEMINI_API_KEY });
 const GROQ_KEY = process.env.GROQ_API_KEY;
-const GROQ_MODELS = ["llama-3.3-70b-versatile", "llama-3.1-8b-instant"];
-const WHISPER_MODEL = "whisper-large-v3-turbo";
-const MODELS = ["gemini-2.5-flash", "gemini-2.5-flash-lite", "gemini-3.5-flash"];
+
+const listEnv = (name, def) =>
+  process.env[name]
+    ? process.env[name].split(",").map((s) => s.trim()).filter(Boolean)
+    : def;
+
+const GROQ_MODELS = listEnv("GROQ_MODELS", ["openai/gpt-oss-120b", "openai/gpt-oss-20b"]);
+const MODELS = listEnv("GEMINI_MODELS", ["gemini-3.8-flash", "gemini-3.5-flash-lite", "gemini-3.5-flash"]);
+const WHISPER_MODEL = process.env.WHISPER_MODEL || "whisper-large-v3-turbo";
+
 const MAX_FILE = 15 * 1024 * 1024;
 const DATA_FILE = "auth/memory.json";
 const YTDLP = "/tmp/yt-dlp";
@@ -51,7 +58,7 @@ function overLimit(jid) {
   return arr.length > LIMIT_PER_HOUR;
 }
 
-// ---------- الأدوات (للجوج ديال المحركات) ----------
+// ---------- الأدوات ----------
 const TOOL_DEFS = [
   { name: "remember_fact", description: "حفظ معلومة ثابتة على الشخص (ماشي كلمات سر ولا صحة ولا فلوس)", props: { fact: ["string", "المعلومة"] }, required: ["fact"] },
   { name: "forget_fact", description: "مسح معلومة محفوظة", props: { keyword: ["string", "كلمة من المعلومة"] }, required: ["keyword"] },
@@ -293,6 +300,7 @@ async function askGemini(jid, contents) {
       } catch (e) {
         console.error("GEMINI ERROR with " + model + " tools#" + i + ":", e.message);
         if (String(e.message).includes("429")) break;
+        if (String(e.message).includes("404")) break;
       }
     }
   }
