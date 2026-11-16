@@ -8,7 +8,7 @@ const { GoogleGenAI } = require("@google/genai");
 const pino = require("pino");
 
 const ai = new GoogleGenAI({ apiKey: process.env.GEMINI_API_KEY });
-const MODEL = "gemini-flash-latest";
+const MODELS = ["gemini-2.5-flash", "gemini-3.5-flash", "gemini-2.5-flash-lite"];
 
 const SYSTEM = `نتا كتجاوب بلاصة مروان فـ واتساب.
 نتا مثقف بزاف وكتعرف فـ كلشي: دراسة، دين، علوم، تقنية، حياة، نصائح. جاوب بدقة ومعلومات صحيحة، وإلا ما كنتيش متأكد قول "ما متأكدش".
@@ -19,6 +19,22 @@ const SYSTEM = `نتا كتجاوب بلاصة مروان فـ واتساب.
 let enabled = true;
 const histories = {};
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+
+async function askGemini(history) {
+  for (const model of MODELS) {
+    try {
+      const res = await ai.models.generateContent({
+        model: model,
+        contents: history,
+        config: { systemInstruction: SYSTEM },
+      });
+      return res.text;
+    } catch (e) {
+      console.error("ERROR with " + model + ":", e.message);
+    }
+  }
+  return null;
+}
 
 async function start() {
   const { state, saveCreds } = await useMultiFileAuthState("auth");
@@ -41,7 +57,9 @@ async function start() {
         fs.rmSync("auth", { recursive: true, force: true });
         console.log("Logged out.");
         process.exit(1);
-      } else start();
+      } else {
+        start();
+      }
     }
   });
 
@@ -70,23 +88,20 @@ async function start() {
     if (!enabled) return;
 
     const history = (histories[jid] ||= []);
-    history.push({ role: "user", parts: [{ text }] });
+    history.push({ role: "user", parts: [{ text: text }] });
     history.splice(0, Math.max(0, history.length - 20));
 
-    try {
-      await sock.sendPresenceUpdate("composing", jid);
-      const res = await ai.models.generateContent({
-        model: MODEL,
-        contents: history,
-        config: { systemInstruction: SYSTEM },
-      });
-      history.push({ role: "model", parts: [{ text: res.text }] });
-      await sleep(2000 + Math.random() * 3000);
-      await sock.sendMessage(jid, { text: res.text });
-    } catch (e) {
-      console.error("ERROR:", e.message);
+    await sock.sendPresenceUpdate("composing", jid);
+    const answer = await askGemini(history);
+
+    if (!answer) {
       history.pop();
+      return;
     }
+
+    history.push({ role: "model", parts: [{ text: answer }] });
+    await sleep(2000 + Math.random() * 3000);
+    await sock.sendMessage(jid, { text: answer });
   });
 }
 
